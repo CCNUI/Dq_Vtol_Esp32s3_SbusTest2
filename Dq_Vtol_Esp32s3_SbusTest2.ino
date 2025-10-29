@@ -381,7 +381,7 @@ void parseUsbPacket() {
 
   char cmd = g_rx_buffer[1];
   
-  if (cmd == 'T' && g_rx_buffer_idx == 5) {
+  if (cmd == 'T' && g_rx_buffer_idx == 6) {
     // 设置目标
     int servo_idx = g_rx_buffer[2];
     if (servo_idx >= 0 && servo_idx < NUM_SERVOS) {
