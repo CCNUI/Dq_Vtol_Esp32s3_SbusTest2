@@ -22,6 +22,12 @@ float g_current_adc[NUM_SERVOS];      // 输入 (Input)
 float g_pid_velocity_out[NUM_SERVOS]; // 输出 (Output)
 float g_target_adc[NUM_SERVOS];       // 设定点 (Setpoint)
 
+// --- [START] 新增: 摆动锁定计数器 ---
+volatile int g_oscillation_count[NUM_SERVOS];
+volatile int g_last_velocity_sign[NUM_SERVOS];
+volatile bool g_servo_locked[NUM_SERVOS];
+// --- [END] 新增: 摆动锁定计数器 ---
+
 // 最终发送到舵机的PWM脉宽 (1000-2000us)
 volatile float g_final_pwm_us[NUM_SERVOS];
 
@@ -91,7 +97,7 @@ void parseUsbCommand(); // 重命名 parseUsbPacket
 
 // Autotune
 void start_autotune(int servo_index);
-void stop_autotune();
+//void stop_autotune(); // [!] 备注: 此函数已声明但未在任何地方定义或使用
 double autotune_input_func(int servo_index);
 void autotune_output_func(double output);
 
@@ -105,7 +111,7 @@ void setup() {
   Serial.println("Using ASCII Command Protocol (Newline-terminated).");
   Serial.println("Commands:");
   Serial.println("  P <idx> <Kp> <Ki> <Kd>  (Set PID)");
-  Serial.println("  T <idx> <target_adc>    (Set Target)");
+  Serial.println("  T <idx> <target_adc>    (Set Target & Unlock)");
   Serial.println("  A <idx>                 (Start Autotune)");
 
   // --- [START] 新增 DEBUG 模式信息 ---
@@ -116,6 +122,10 @@ void setup() {
   Serial.println("--- 初始值: S5=1400, S6=1500, S7=1600");
   Serial.println("--- 使用 'S <idx> <pwm_us>' (例如 'S 5 1200') 来覆盖。");
   Serial.println("------------------------------------------------------");
+#else
+  Serial.println("--- INFO: 正常 PID 模式已启用。");
+  Serial.println("--- 舵机启动时锁定在 1500us。");
+  Serial.println("--- 发送 'T <idx> <target>' 来解锁指定通道。");
 #endif
   // --- [END] 新增 DEBUG 模式信息 ---
 
@@ -134,6 +144,13 @@ void setup() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     // 默认启动时目标为中心点
     g_target_adc[i] = g_servo_limits[i].center_adc;
+
+    // --- [START] 新增: 初始化摆动锁定状态 ---
+    // 启动时默认为锁定状态，直到收到 'T' 命令
+    g_oscillation_count[i] = 0;
+    g_last_velocity_sign[i] = 0;
+    g_servo_locked[i] = true; 
+    // --- [END] 新增: 初始化摆动锁定状态 ---
   }
 
   // 3. 设置 PID 控制器
@@ -176,13 +193,13 @@ void setup() {
     0                       // 固定在 Core 0
   );
 
-  // 9. 设置 8kHz 硬件定时器
-  Serial.println("Starting 8kHz PID Timer...");
+  // 9. 设置 硬件定时器
+  Serial.printf("Starting PID Timer ( %d us / %.1f Hz )...\n", PID_LOOP_PERIOD_US, 1000000.0 / PID_LOOP_PERIOD_US);
   // *** 已修复: ESP32 Core 3.x 定时器 API ***
   pid_timer = timerBegin(1000000);  // 1MHz (1µs 精度)
   timerAttachInterrupt(pid_timer, &onPidTimer);
   // *** 已修复: 添加第4个参数 (0) 用于自动重载 ***
-  timerAlarm(pid_timer, PID_LOOP_PERIOD_US, true, 0);  // 125µs, 自动重载, 0 = 无限
+  timerAlarm(pid_timer, PID_LOOP_PERIOD_US, true, 0);  // 自动重载, 0 = 无限
   timerStart(pid_timer);
 
   onboard_led.fill(onboard_led.Color(0, 255, 0));  // 绿色表示运行
@@ -227,7 +244,7 @@ void loop() {
 // ==                 CORE 1 - PID LOOP TASK
 // ======================================================================
 
-// 8kHz 定时器中断
+// 定时器中断
 void IRAM_ATTR onPidTimer() {
   // 只是通知 PID 任务运行
   // 不要在 ISR 中做任何实际工作!
@@ -272,8 +289,9 @@ void pidLoopTask(void *pvParameters) {
 
     for (int i = 0; i < NUM_SERVOS; i++) {
       // 1. 更新 LEDC (硬件 PWM)
-      // (20000µs = 50Hz 周期)
-      uint32_t duty = (uint32_t)((local_pwm_us[i] / 20000.0) * 65535.0);
+      // --- [!] 已修改: 200Hz 周期 ---
+      // (5000µs = 200Hz 周期)
+      uint32_t duty = (uint32_t)((local_pwm_us[i] / 5000.0) * 65535.0);
       ledcWrite(g_ledc_channels[i], duty);
 
       // 2. 存储值供 SBUS 任务使用
@@ -288,17 +306,38 @@ void pidLoopTask(void *pvParameters) {
 // --- [END] 新增: 舵机测试模式 ---
 
   // --- NORMAL PID MODE ---
+  
+  // --- [!] 已修改: 200Hz 周期 ---
+  // [NEW] 计算一次1500us的占空比，用于锁定
+  const uint32_t center_duty = (uint32_t)((1500.0 / 5000.0) * 65535.0);
+
   while (true) {
     // 等待 onPidTimer 的通知
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // --- 125µs 预算开始 ---
+    // --- [!] 5000µs 预算开始 ---
 
     // 1. 读取所有 ADC
     read_all_adcs();
 
     // 2. 运行 8 个 PID 控制器
     for (int i = 0; i < NUM_SERVOS; i++) {
+
+      // --- [START] 新增: 摆动锁定逻辑 ---
+      
+      // [NEW] Step 1: 检查舵机是否被锁定
+      if (g_servo_locked[i]) {
+        portENTER_CRITICAL(&g_pid_mux);
+        g_final_pwm_us[i] = 1500.0;
+        g_sbus_channels[i] = SBUS_CENTER_VAL;
+        portEXIT_CRITICAL(&g_pid_mux);
+        
+        ledcWrite(g_ledc_channels[i], center_duty);
+        continue; // 跳过此舵机的所有PID计算
+      }
+      
+      // --- [END] 新增: 摆动锁定逻辑 ---
+
 
       // 检查是否在硬限位
       bool at_min_limit = (g_current_adc[i] <= g_servo_limits[i].min_adc);
@@ -308,7 +347,54 @@ void pidLoopTask(void *pvParameters) {
       pid_controllers[i].Compute();
       // g_pid_velocity_out[i] 现在包含了 PID 输出 (范围 -500 到 500)
 
-      // 3. 应用限位和死区
+
+      // --- [START] 摆动锁定逻辑 (Bug 修复) ---
+
+      // [NEW] Step 2: 计数摆动 (基于速度符号)
+      int current_sign = 0;
+
+      // [!] 修复: 只有当速度*离开*死区时，才计算符号。
+      // [!] 在死区内的所有东西 (例如 -100 到 +100) 都被认为是 "0"。
+      if (g_pid_velocity_out[i] > PID_VELOCITY_DEADZONE) current_sign = 1;
+      else if (g_pid_velocity_out[i] < -PID_VELOCITY_DEADZONE) current_sign = -1;
+      // 否则, current_sign 保持 0 (在死区内)
+
+      // [!] 修复: 只有当符号从 +1 变为 -1, 或从 -1 变为 +1 时才计数
+      // (即, 必须越过整个死区)
+      if (current_sign != 0 && current_sign != g_last_velocity_sign[i] && g_last_velocity_sign[i] != 0) {
+        // 这意味着 g_last_velocity_sign 是 1 而 current_sign 是 -1
+        // 或者 g_last_velocity_sign 是 -1 而 current_sign 是 1
+        portENTER_CRITICAL(&g_pid_mux);
+        g_oscillation_count[i]++;
+        portEXIT_CRITICAL(&g_pid_mux);
+      }
+
+      // 无论如何都要更新 "上一个符号"
+      // 但只有当它*不在*死区内时才更新
+      if (current_sign != 0) {
+          portENTER_CRITICAL(&g_pid_mux);
+          g_last_velocity_sign[i] = current_sign;
+          portEXIT_CRITICAL(&g_pid_mux);
+      }
+      
+      // [NEW] Step 3: 检查是否达到摆动上限
+      if (g_oscillation_count[i] >= PID_OSCILLATION_LIMIT) {
+        portENTER_CRITICAL(&g_pid_mux);
+        g_servo_locked[i] = true;
+        // 将目标设为当前位置, 停止PID误差累积
+        g_target_adc[i] = g_current_adc[i];
+        g_final_pwm_us[i] = 1500.0;
+        g_sbus_channels[i] = SBUS_CENTER_VAL;
+        portEXIT_CRITICAL(&g_pid_mux);
+        
+        ledcWrite(g_ledc_channels[i], center_duty);
+        continue; // 跳过此舵机的剩余PID输出逻辑
+      }
+
+      // --- [END] 摆动锁定逻辑 (Bug 修复) ---
+
+
+      // 3. 应用限位和死区 (如果未锁定)
       float target_velocity = g_pid_velocity_out[i];
 
       // 应用硬限位 (已修复反向舵机逻辑)
@@ -360,8 +446,9 @@ void pidLoopTask(void *pvParameters) {
       pwm_us = constrain(pwm_us, 1000.0, 2000.0);
 
       // 5. 更新 LEDC (硬件 PWM)
-      // (20000µs = 50Hz 周期)
-      uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
+      // --- [!] 已修改: 200Hz 周期 ---
+      // (5000µs = 200Hz 周期)
+      uint32_t duty = (uint32_t)((pwm_us / 5000.0) * 65535.0);
 
       // *** 已修复: 使用存储的 g_ledc_channels 数组 ***
       ledcWrite(g_ledc_channels[i], duty);
@@ -374,7 +461,7 @@ void pidLoopTask(void *pvParameters) {
       portEXIT_CRITICAL(&g_pid_mux);
     }
 
-    // --- 125µs 预算结束 ---
+    // --- [!] 5000µs 预算结束 ---
   }
 #endif // 结束 DEBUG_FIXED_PWM_OUTPUT 的 #if
 }
@@ -391,14 +478,17 @@ void IRAM_ATTR read_all_adcs() {
 
 // 设置 8 个 LEDC 通道
 void setup_pwm() {
-  Serial.println("Setting up 8 LEDC channels...");
+  Serial.println("Setting up 8 LEDC channels (200 Hz)...");
   for (int i = 0; i < NUM_SERVOS; i++) {
     // *** 已修复: ESP32 3.x API - ledcAttach 替代 ledcSetup/ledcAttachPin ***
     // ledcAttach(pin, freq, resolution) 返回分配的通道
-    g_ledc_channels[i] = ledcAttach(PWM_PINS[i], 50, 16);  // 引脚, 50Hz, 16位
+    
+    // --- [!] 已修改: 50Hz -> 200Hz ---
+    g_ledc_channels[i] = ledcAttach(PWM_PINS[i], 200, 16);  // 引脚, 200Hz, 16位
 
     // 设置初始中点
-    uint32_t center_duty = (uint32_t)((1500.0 / 20000.0) * 65535.0);
+    // --- [!] 已修改: 200Hz 周期 ---
+    uint32_t center_duty = (uint32_t)((1500.0 / 5000.0) * 65535.0);
     ledcWrite(g_ledc_channels[i], center_duty);  // 使用返回的通道
     g_final_pwm_us[i] = 1500.0;
   }
@@ -422,7 +512,8 @@ void setup_pid_controllers() {
     );
 
     // 设置 PID 采样时间 (虽然我们用定时器触发，但设置一下没坏处)
-    pid_controllers[i].SetSampleTimeUs(PID_LOOP_PERIOD_US);
+    // --- [!] 已修改: 匹配 200Hz ---
+    pid_controllers[i].SetSampleTimeUs(PID_LOOP_PERIOD_US); 
     // 设置输出限制 (速度)
     pid_controllers[i].SetOutputLimits(-PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT);
     // 切换到自动模式
@@ -536,9 +627,16 @@ void parseUsbCommand() {
         // 安全地更新目标值
         portENTER_CRITICAL(&g_pid_mux);
         g_target_adc[servo_idx] = (float)target_val;
+        
+        // --- [START] 新增: 重置摆动计数器并解锁 ---
+        g_oscillation_count[servo_idx] = 0;
+        g_last_velocity_sign[servo_idx] = 0;
+        g_servo_locked[servo_idx] = false; // 解锁
+        // --- [END] 新增: 重置摆动计数器并解锁 ---
+
         portEXIT_CRITICAL(&g_pid_mux);
 
-        Serial.printf("Set Servo %d Target to %d\n", servo_idx, target_val);
+        Serial.printf("Set Servo %d Target to %d (Unlocked)\n", servo_idx, target_val);
       } else {
         Serial.printf("Error: Invalid servo index %d\n", servo_idx);
       }
@@ -617,22 +715,32 @@ void handle_telemetry() {
   float adc_copy[NUM_SERVOS];
   float pwm_copy[NUM_SERVOS];
   float tgt_copy[NUM_SERVOS];
+  
+  // --- [START] 已修改: L=%d -> O=%d ---
+  int count_copy[NUM_SERVOS]; // 替换 locked_copy
+  // --- [END] 已修改 ---
 
   portENTER_CRITICAL(&g_pid_mux);
   memcpy(adc_copy, g_current_adc, sizeof(adc_copy));
   memcpy(pwm_copy, (void *)g_final_pwm_us, sizeof(pwm_copy));
   memcpy(tgt_copy, g_target_adc, sizeof(tgt_copy));
+  // --- [START] 已修改: L=%d -> O=%d ---
+  memcpy(count_copy, (void*)g_oscillation_count, sizeof(count_copy)); // 复制计数值
+  // --- [END] 已修改 ---
   portEXIT_CRITICAL(&g_pid_mux);
 
   // 打印复制的数据
-  // 格式: [S0: ADC=1234, TGT=1235, PWM=1500]
+  // --- [START] 已修改: L=%d -> O=%d ---
+  // 格式: [S0: ADC=1234, TGT=1235, PWM=1500, O=0] (O=0 表示摆动计数)
   for (int i = 0; i < NUM_SERVOS; i++) {
-    Serial.printf("[S%d: ADC=%.0f, TGT=%.0f, PWM=%.0f] ",
+    Serial.printf("[S%d: ADC=%.0f, TGT=%.0f, PWM=%.0f, O=%d] ", // [!] 已修改
                   i,
                   adc_copy[i],
                   tgt_copy[i],
-                  pwm_copy[i]);
+                  pwm_copy[i],
+                  count_copy[i]); // [!] 已修改
   }
+  // --- [END] 已修改 ---
   Serial.println();
 }
 
@@ -753,7 +861,8 @@ void autotune_output_func(double output) {
   // --- [END] 逻辑修改 ---
 
   // 直接写入 PWM
-  uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
+  // --- [!] 已修改: 200Hz 周期 ---
+  uint32_t duty = (uint32_t)((pwm_us / 5000.0) * 65535.0);
   // *** 已修复: 使用 g_ledc_channels 数组 ***
   ledcWrite(g_ledc_channels[g_autotune_servo_idx], duty);
 }
