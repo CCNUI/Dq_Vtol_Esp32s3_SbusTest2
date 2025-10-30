@@ -16,9 +16,9 @@ QuickPID pid_controllers[NUM_SERVOS];
 
 // PID 计算的输入、输出和设定点
 // 这些是 QuickPID 对象内部指针将指向的变量
-float g_current_adc[NUM_SERVOS];      // 输入 (Input)
-float g_pid_velocity_out[NUM_SERVOS]; // 输出 (Output)
-float g_target_adc[NUM_SERVOS];       // 设定点 (Setpoint)
+float g_current_adc[NUM_SERVOS];       // 输入 (Input)
+float g_pid_velocity_out[NUM_SERVOS];  // 输出 (Output)
+float g_target_adc[NUM_SERVOS];        // 设定点 (Setpoint)
 
 // 最终发送到舵机的PWM脉宽 (1000-2000us)
 volatile float g_final_pwm_us[NUM_SERVOS];
@@ -147,13 +147,13 @@ void setup() {
   // 6. 创建 Core 1 PID 任务
   Serial.println("Creating Core 1 PID Task...");
   xTaskCreatePinnedToCore(
-    pidLoopTask,            // 任务函数
-    "PIDLoop",              // 任务名称
-    8192,                   // 堆栈大小
-    NULL,                   // 任务参数
-    configMAX_PRIORITIES - 1, // 最高优先级
-    &g_pid_task_handle,     // 任务句柄
-    1                       // 固定在 Core 1
+    pidLoopTask,               // 任务函数
+    "PIDLoop",                 // 任务名称
+    8192,                      // 堆栈大小
+    NULL,                      // 任务参数
+    configMAX_PRIORITIES - 1,  // 最高优先级
+    &g_pid_task_handle,        // 任务句柄
+    1                          // 固定在 Core 1
   );
 
   // 7. 创建 Core 0 SBUS 任务
@@ -194,13 +194,13 @@ void loop() {
   if (!g_is_autotuning) {
     // USB 输入始终处理
     handle_usb_input();
-    
+
     // 仅在不在 Autotune 时打印遥测 (防止阻塞)
     handle_telemetry();
   } else {
     // Autotune 期间，仍然检查 USB 输入
-    // (虽然 Autotune 函数 g_autotuner.tune() 是阻塞的, 
-    // 但它内部调用的 autotune_output_func 包含 yield(), 
+    // (虽然 Autotune 函数 g_autotuner.tune() 是阻塞的,
+    // 但它内部调用的 autotune_output_func 包含 yield(),
     // 所以 loop 理论上仍有机会运行)
     handle_usb_input();
   }
@@ -249,7 +249,7 @@ void pidLoopTask(void *pvParameters) {
   // 1. (仅一次) 设置 S5, S6, S7 的初始覆盖值
   portENTER_CRITICAL(&g_pid_mux);
   g_final_pwm_us[5] = 1400.0;
-  g_final_pwm_us[6] = 1500.0; // 冗余，但明确
+  g_final_pwm_us[6] = 1500.0;  // 冗余，但明确
   g_final_pwm_us[7] = 1600.0;
   portEXIT_CRITICAL(&g_pid_mux);
 
@@ -258,7 +258,7 @@ void pidLoopTask(void *pvParameters) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
     // 在此模式下，我们不读取ADC或计算PID
-    // 我们只获取 g_final_pwm_us (由 Core 0 的串口命令设置) 
+    // 我们只获取 g_final_pwm_us (由 Core 0 的串口命令设置)
     // 并将其写入 PWM 和 SBUS
 
     float local_pwm_us[NUM_SERVOS];
@@ -278,8 +278,8 @@ void pidLoopTask(void *pvParameters) {
     }
   }
 
-#else // 正常 PID 模式
-// --- [END] 舵机测试模式 ---
+#else   // 正常 PID 模式
+  // --- [END] 舵机测试模式 ---
 
   // --- NORMAL PID MODE ---
   while (true) {
@@ -297,13 +297,13 @@ void pidLoopTask(void *pvParameters) {
         // --- 自动调参覆盖模式 ---
         // 在此模式下，我们跳过PID计算
         // 只应用 g_final_pwm_us (由 autotune_output_func 设置)
-        
+
         // 1. 从 g_final_pwm_us 获取 PWM
         float pwm_us;
         portENTER_CRITICAL(&g_pid_mux);
         pwm_us = g_final_pwm_us[i];
         portEXIT_CRITICAL(&g_pid_mux);
-        
+
         // 2. 更新 LEDC
         uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
         ledcWrite(g_ledc_channels[i], duty);
@@ -312,9 +312,9 @@ void pidLoopTask(void *pvParameters) {
         portENTER_CRITICAL(&g_pid_mux);
         g_sbus_channels[i] = map(pwm_us, 1000, 2000, SBUS_MIN_VAL, SBUS_MAX_VAL);
         portEXIT_CRITICAL(&g_pid_mux);
-        
+
         // 4. 跳过此舵机的PID计算
-        continue; 
+        continue;
       }
       // --- [END] AUTOTUNE 修复 ---
 
@@ -364,9 +364,9 @@ void pidLoopTask(void *pvParameters) {
       g_final_pwm_us[i] = pwm_us;
       g_sbus_channels[i] = map(pwm_us, 1000, 2000, SBUS_MIN_VAL, SBUS_MAX_VAL);
       portEXIT_CRITICAL(&g_pid_mux);
-    } // 结束 for 循环
-  } // 结束 while(true)
-#endif // 结束 DEBUG_FIXED_PWM_OUTPUT 的 #if
+    }  // 结束 for 循环
+  }    // 结束 while(true)
+#endif  // 结束 DEBUG_FIXED_PWM_OUTPUT 的 #if
 }
 
 
@@ -399,13 +399,13 @@ void setup_pid_controllers() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     // 链接 QuickPID 到我们的全局变量
     pid_controllers[i] = QuickPID(
-      &g_current_adc[i],          // *Input
-      &g_pid_velocity_out[i],     // *Output
-      &g_target_adc[i],           // *Setpoint
-      DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, // Tunings
-      QuickPID::pMode::pOnError,      // Proportional on Error
-      QuickPID::dMode::dOnMeas,       // Derivative on Measurement
-      QuickPID::iAwMode::iAwCondition,  // Anti-windup
+      &g_current_adc[i],                         // *Input
+      &g_pid_velocity_out[i],                    // *Output
+      &g_target_adc[i],                          // *Setpoint
+      DEFAULT_KP, DEFAULT_KI, DEFAULT_KD,        // Tunings
+      QuickPID::pMode::pOnError,                 // Proportional on Error
+      QuickPID::dMode::dOnMeas,                  // Derivative on Measurement
+      QuickPID::iAwMode::iAwCondition,           // Anti-windup
       (QuickPID::Action)g_pid_reverse_action[i]  // 从 config.h 读取设置
     );
 
@@ -527,10 +527,10 @@ void parseUsbCommand() {
     } else {
       Serial.printf("Error: Invalid 'A' command format. Expected: A <idx>\n", g_rx_buffer);
     }
-  
+
   } else if (cmd_char == 'S') {
-  
-  #if DEBUG_FIXED_PWM_OUTPUT == 1
+
+#if DEBUG_FIXED_PWM_OUTPUT == 1
     // 舵机测试: S <idx> <pwm_us>
     int servo_idx = -1;
     int pwm_val_int = 0;
@@ -549,9 +549,9 @@ void parseUsbCommand() {
     } else {
       Serial.printf("Error: Invalid 'S' command format. Expected: S <idx> <pwm_us>\n", g_rx_buffer);
     }
-  #else
+#else
     Serial.println("Error: 'S' command is only available when DEBUG_FIXED_PWM_OUTPUT is 1.");
-  #endif
+#endif
 
   } else {
     Serial.printf("Error: Unknown command '%s'\n", g_rx_buffer);
@@ -668,19 +668,19 @@ void autotune_output_func(double output) {
   // Autotune 是一个长时阻塞操作，在 Core 0 上运行
   // 调用 yield() 会交出控制权 (vTaskDelay(1))
   // 这会重置任务看门狗并防止重启
-  yield(); 
+  yield();
 
   // autotune 库的输出被配置为 1000-2000
   float pwm_us = constrain(output, 1000.0, 2000.0);
 
   // --- 应用死区补偿 (Jump) (使用 config.h 中的 50) ---
-  float velocity_out = pwm_us - 1500.0; 
+  float velocity_out = pwm_us - 1500.0;
   if (velocity_out > 0.0) {
     velocity_out += PID_VELOCITY_DEADZONE;
   } else if (velocity_out < 0.0) {
     velocity_out -= PID_VELOCITY_DEADZONE;
   }
-  
+
   pwm_us = 1500.0 + velocity_out;
   pwm_us = constrain(pwm_us, 1000.0, 2000.0);
   // --- 结束死区逻辑 ---
@@ -708,10 +708,10 @@ void start_autotune(int servo_index) {
   // 2. 配置调谐器
   g_tuning_pid_instance = PID(
     g_servo_limits[servo_index].center_adc,  // 目标值
-    10000,                  // 环路间隔 (us) -> 10ms
-    1000, 2000                // 输出范围 (pwm us)
+    10000,                                   // 环路间隔 (us) -> 10ms
+    1000, 2000                               // 输出范围 (pwm us)
   );
-  
+
   // 确保 Autotune 使用正确的舵机方向
   if (g_pid_reverse_action[servo_index] == 1) {
     g_tuning_pid_instance.SetControllerDirection(REVERSE);
@@ -724,7 +724,7 @@ void start_autotune(int servo_index) {
   g_autotuner.setPID(g_tuning_pid_instance);
   g_autotuner.setTargetValue(g_servo_limits[servo_index].center_adc);
   g_autotuner.setConstrains(1000.0, 2000.0);  // 输出是 PWM us
-  g_autotuner.setLoopInterval(10000);       // 10ms
+  g_autotuner.setLoopInterval(10000);         // 10ms
   g_autotuner.setTuningCycles(10);
   g_autotuner.setMode(pid_tuner::mode_t::CLASSIC_PID);
 
