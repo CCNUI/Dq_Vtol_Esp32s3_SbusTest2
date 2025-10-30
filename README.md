@@ -11,6 +11,9 @@ ESP32-S3 8-Channel closed-loop PID servo controller with SBUS output, 200Hz high
 
 控制器通过ADC读取8个通道的舵机位置反馈（例如电位器），计算PID后输出8路PWM信号（200Hz）以闭环方式驱动舵机。同时，它还将PWM信号实时打包成SBUS帧，通过独立串口（UART）发送出去。
 
+## 已知问题（Commit: Third Succeed Run)
+* PID AutoTune不起作用：长时间无法结束AutoTune。
+
 ## 核心特性
 
 * **多核架构:** 8路PID闭环控制运行在 Core 1，串口通信和SBUS输出任务运行在 Core 0，确保PID环路不受干扰。
