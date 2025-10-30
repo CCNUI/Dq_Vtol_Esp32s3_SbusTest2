@@ -1,13 +1,15 @@
-//@FILE Dq_Vtol_Esp32s3_SbusTest2.ino START
 #include <Arduino.h>
 #include <HardwareSerial.h>
 #include <Adafruit_NeoPixel.h>
+
+// [!] 修复库冲突
+#include "pid.h"
 #include "QuickPID.h"
 #include "pid-autotune.h"  // 包含 Autotune 库
 #include "config.h"        // 包含所有配置
 
 // ======================================================================
-// ==                           GLOBAL VARIABLES
+// ==                      GLOBAL VARIABLES
 // ======================================================================
 
 // -- Core 1 (PID) 变量 --
@@ -26,7 +28,7 @@ volatile float g_final_pwm_us[NUM_SERVOS];
 // *** 新增: 存储 LEDC 通道号 ***
 int g_ledc_channels[NUM_SERVOS];
 
-// 硬件定时器 (用于触发 1kHz 环路)
+// 硬件定时器 (用于触发 8kHz 环路)
 hw_timer_t *pid_timer = NULL;
 
 // Core 1 PID 任务句柄
@@ -52,9 +54,10 @@ TaskHandle_t g_sbus_task_handle = NULL;
 // 遥测数据输出计时器
 unsigned long g_last_telemetry_time = 0;
 
-// USB 串口接收缓冲区
-#define RX_BUFFER_SIZE 64
+// --- [START] 修改: 增大缓冲区并改为 char (用于 ASCII) ---
+#define RX_BUFFER_SIZE 64 // 增加缓冲区大小以容纳 ASCII 命令 (例如 "P 0 1.234 0.5 0.01")
 char g_rx_buffer[RX_BUFFER_SIZE];
+// --- [END] 修改: 增大缓冲区并改为 char (用于 ASCII) ---
 uint8_t g_rx_buffer_idx = 0;
 
 // Autotune
@@ -64,7 +67,7 @@ volatile bool g_is_autotuning = false;
 volatile int g_autotune_servo_idx = 0;
 
 // ======================================================================
-// ==                           PROTOTYPES
+// ==                       PROTOTYPES
 // ======================================================================
 
 // Core 1
@@ -80,8 +83,10 @@ void setup_sbus();
 void update_sbus_frame();
 void ledBreathingTask(void *pvParameters);
 void handle_telemetry();
+// --- [START] 修改: 更改函数名称 ---
 void handle_usb_input();
-void parseUsbCommand();
+void parseUsbCommand(); // 重命名 parseUsbPacket
+// --- [END] 修改: 更改函数名称 ---
 
 
 // Autotune
@@ -91,7 +96,7 @@ double autotune_input_func(int servo_index);
 void autotune_output_func(double output);
 
 // ======================================================================
-// ==                           SETUP (CORE 0)
+// ==                      SETUP (CORE 0)
 // ======================================================================
 void setup() {
   // 启动 USB 串口
@@ -103,7 +108,6 @@ void setup() {
   Serial.println("  T <idx> <target_adc>    (Set Target)");
   Serial.println("  A <idx>                 (Start Autotune)");
 
-
   // --- [START] 新增 DEBUG 模式信息 ---
 #if DEBUG_FIXED_PWM_OUTPUT == 1
   Serial.println("------------------------------------------------------");
@@ -112,13 +116,12 @@ void setup() {
   Serial.println("--- 初始值: S5=1400, S6=1500, S7=1600");
   Serial.println("--- 使用 'S <idx> <pwm_us>' (例如 'S 5 1200') 来覆盖。");
   Serial.println("------------------------------------------------------");
-#else
-  Serial.println("--- DEBUG_FIXED_PWM_OUTPUT is DISABLED. ---");
-  Serial.println("--- Running normal PID control loop. ---");
 #endif
   // --- [END] 新增 DEBUG 模式信息 ---
 
-  // 设置 ADC
+  // 设置 ADC (注意: S3 的 ADC 精度可能需要校准)
+  // ESP32-S3 上的 ADC2 (TOUCH 引脚使用) 不能与 WiFi 同时使用
+  // 我们在这里设置11dB衰减 (0-3.3V) 和12位宽度 (0-4095)
   for (int i = 0; i < NUM_SERVOS; i++) {
     analogSetAttenuation(ADC_11db);
     pinMode(ADC_PINS[i], INPUT);
@@ -129,6 +132,7 @@ void setup() {
 
   // 2. 初始化 PID 设定点
   for (int i = 0; i < NUM_SERVOS; i++) {
+    // 默认启动时目标为中心点
     g_target_adc[i] = g_servo_limits[i].center_adc;
   }
 
@@ -144,35 +148,41 @@ void setup() {
   onboard_led.fill(onboard_led.Color(0, 0, 255));  // 蓝色表示启动
   onboard_led.show();
 
-  // 6. 创建 Core 1 PID 任务
+  // 6. 设置 USB CDC 回调 (Core 0)
+  // *** 已修复: 移除 onData 回调，我们将使用 loop() 轮询 ***
+  // Serial.onData(onUsbData);
+
+  // 7. 创建 Core 1 PID 任务
   Serial.println("Creating Core 1 PID Task...");
   xTaskCreatePinnedToCore(
     pidLoopTask,            // 任务函数
     "PIDLoop",              // 任务名称
-    8192,                   // 堆栈大小
+    8192,                   // 堆栈大小 (PID + aalogRead 需要较大堆栈)
     NULL,                   // 任务参数
     configMAX_PRIORITIES - 1, // 最高优先级
     &g_pid_task_handle,     // 任务句柄
     1                       // 固定在 Core 1
   );
 
-  // 7. 创建 Core 0 SBUS 任务
+  // 8. 创建 Core 0 SBUS 任务
   Serial.println("Creating Core 0 SBUS Task...");
   xTaskCreatePinnedToCore(
-    sbusTask,             // 任务函数
-    "SBUSTx",             // 任务名称
-    2048,                 // 堆栈大小
-    NULL,                 // 任务参数
-    5,                    // 中等优先级
-    &g_sbus_task_handle,  // 任务句柄
-    0                     // 固定在 Core 0
+    sbusTask,               // 任务函数
+    "SBUSTx",               // 任务名称
+    2048,                   // 堆栈大小
+    NULL,                   // 任务参数
+    5,                      // 中等优先级
+    &g_sbus_task_handle,    // 任务句柄
+    0                       // 固定在 Core 0
   );
 
-  // 8. 设置 1kHz 硬件定时器
-  Serial.println("Starting 1kHz PID Timer...");
+  // 9. 设置 8kHz 硬件定时器
+  Serial.println("Starting 8kHz PID Timer...");
+  // *** 已修复: ESP32 Core 3.x 定时器 API ***
   pid_timer = timerBegin(1000000);  // 1MHz (1µs 精度)
   timerAttachInterrupt(pid_timer, &onPidTimer);
-  timerAlarm(pid_timer, PID_LOOP_PERIOD_US, true, 0);  // 1000µs (1kHz), 自动重载
+  // *** 已修复: 添加第4个参数 (0) 用于自动重载 ***
+  timerAlarm(pid_timer, PID_LOOP_PERIOD_US, true, 0);  // 125µs, 自动重载, 0 = 无限
   timerStart(pid_timer);
 
   onboard_led.fill(onboard_led.Color(0, 255, 0));  // 绿色表示运行
@@ -181,30 +191,22 @@ void setup() {
 }
 
 // ======================================================================
-// ==                           LOOP (CORE 0)
+// ==                      LOOP (CORE 0)
 // ======================================================================
 void loop() {
   // Core 0 的主循环只负责低优先级的任务：
-  // 1. USB 串行输入
-  // 2. 遥测数据输出 (如果不在 Autotune 期间)
+  // 1. USB 串行输入 (新)
+  // 2. 遥测数据输出
   // 3. 呼吸灯
   // (SBUS 输出由它自己的任务处理)
-  // (Autotune 会阻塞此循环)
 
   if (!g_is_autotuning) {
-    // USB 输入始终处理
+    // *** 新增: 轮询 USB 输入 ***
     handle_usb_input();
-    
-    // 仅在不在 Autotune 时打印遥测 (防止阻塞)
-    handle_telemetry();
-  } else {
-    // Autotune 期间，仍然检查 USB 输入
-    // (虽然 Autotune 函数 g_autotuner.tune() 是阻塞的, 
-    // 但它内部调用的 autotune_output_func 包含 yield(), 
-    // 所以 loop 理论上仍有机会运行)
-    handle_usb_input();
-  }
 
+    // 正常遥测
+    handle_telemetry();
+  }
 
   // 呼吸灯
   uint8_t brightness = (exp(sin(millis() / 2000.0 * PI)) - 0.36787944) * (float)LED_MAX_BRIGHTNESS;
@@ -222,12 +224,13 @@ void loop() {
 
 
 // ======================================================================
-// ==                     CORE 1 - PID LOOP TASK
+// ==                 CORE 1 - PID LOOP TASK
 // ======================================================================
 
-// 1kHz 定时器中断
+// 8kHz 定时器中断
 void IRAM_ATTR onPidTimer() {
   // 只是通知 PID 任务运行
+  // 不要在 ISR 中做任何实际工作!
   BaseType_t xHigherPriorityTaskWoken = pdFALSE;
   vTaskNotifyGiveFromISR(g_pid_task_handle, &xHigherPriorityTaskWoken);
   if (xHigherPriorityTaskWoken) {
@@ -239,7 +242,7 @@ void IRAM_ATTR onPidTimer() {
 void pidLoopTask(void *pvParameters) {
   Serial.println("pidLoopTask running on Core 1.");
 
-// --- [START] 舵机测试模式 ---
+// --- [START] 新增: 舵机测试模式 ---
 #if DEBUG_FIXED_PWM_OUTPUT == 1
   // --- DEBUG MODE ---
   // PID 任务在此模式下仅负责应用 g_final_pwm_us (由串口设置)
@@ -247,6 +250,7 @@ void pidLoopTask(void *pvParameters) {
   Serial.println("PID Task running in DEBUG_FIXED_PWM_OUTPUT mode.");
 
   // 1. (仅一次) 设置 S5, S6, S7 的初始覆盖值
+  // g_final_pwm_us 已经在 setup_pwm() 中被初始化为 1500
   portENTER_CRITICAL(&g_pid_mux);
   g_final_pwm_us[5] = 1400.0;
   g_final_pwm_us[6] = 1500.0; // 冗余，但明确
@@ -268,111 +272,116 @@ void pidLoopTask(void *pvParameters) {
 
     for (int i = 0; i < NUM_SERVOS; i++) {
       // 1. 更新 LEDC (硬件 PWM)
+      // (20000µs = 50Hz 周期)
       uint32_t duty = (uint32_t)((local_pwm_us[i] / 20000.0) * 65535.0);
       ledcWrite(g_ledc_channels[i], duty);
 
       // 2. 存储值供 SBUS 任务使用
       portENTER_CRITICAL(&g_pid_mux);
+      // g_final_pwm_us 已经被 Core 0 设置了，这里只更新 sbus channels
       g_sbus_channels[i] = map(local_pwm_us[i], 1000, 2000, SBUS_MIN_VAL, SBUS_MAX_VAL);
       portEXIT_CRITICAL(&g_pid_mux);
     }
   }
 
 #else // 正常 PID 模式
-// --- [END] 舵机测试模式 ---
+// --- [END] 新增: 舵机测试模式 ---
 
   // --- NORMAL PID MODE ---
   while (true) {
     // 等待 onPidTimer 的通知
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    // 1. 读取所有 ADC (始终运行)
+    // --- 125µs 预算开始 ---
+
+    // 1. 读取所有 ADC
     read_all_adcs();
 
     // 2. 运行 8 个 PID 控制器
     for (int i = 0; i < NUM_SERVOS; i++) {
 
-      // --- [START] AUTOTUNE 修复: 检查是否跳过PID ---
-      if (g_is_autotuning && i == g_autotune_servo_idx) {
-        // --- 自动调参覆盖模式 ---
-        // 在此模式下，我们跳过PID计算
-        // 只应用 g_final_pwm_us (由 autotune_output_func 设置)
-        
-        // 1. 从 g_final_pwm_us 获取 PWM
-        float pwm_us;
-        portENTER_CRITICAL(&g_pid_mux);
-        pwm_us = g_final_pwm_us[i];
-        portEXIT_CRITICAL(&g_pid_mux);
-        
-        // 2. 更新 LEDC
-        uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
-        ledcWrite(g_ledc_channels[i], duty);
-
-        // 3. 存储值供 SBUS 任务使用
-        portENTER_CRITICAL(&g_pid_mux);
-        g_sbus_channels[i] = map(pwm_us, 1000, 2000, SBUS_MIN_VAL, SBUS_MAX_VAL);
-        portEXIT_CRITICAL(&g_pid_mux);
-        
-        // 4. 跳过此舵机的PID计算
-        continue; 
-      }
-      // --- [END] AUTOTUNE 修复 ---
-
-
-      // --- 正常PID计算 ---
       // 检查是否在硬限位
       bool at_min_limit = (g_current_adc[i] <= g_servo_limits[i].min_adc);
       bool at_max_limit = (g_current_adc[i] >= g_servo_limits[i].max_adc);
 
       // QuickPID 计算
       pid_controllers[i].Compute();
+      // g_pid_velocity_out[i] 现在包含了 PID 输出 (范围 -500 到 500)
+
+      // 3. 应用限位和死区
       float target_velocity = g_pid_velocity_out[i];
 
-      // 应用硬限位
+      // 应用硬限位 (已修复反向舵机逻辑)
       bool is_reversed = (g_pid_reverse_action[i] == 1);
+
       if (is_reversed) {
+        // --- 反向舵机逻辑 ---
+        // target_velocity > 0 (PWM > 1500) 是 "减小 ADC"
+        // target_velocity < 0 (PWM < 1500) 是 "增大 ADC"
+
         if (at_min_limit && target_velocity > 0) {
+          // 在最小处 (1500), 且 PID 正试图 "减小 ADC", 停止。
           target_velocity = 0;
         } else if (at_max_limit && target_velocity < 0) {
+          // 在最大处 (2400), 且 PID 正试图 "增大 ADC", 停止。
           target_velocity = 0;
         }
       } else {
+        // --- 正向舵机逻辑 (原始代码) ---
+        // target_velocity > 0 (PWM > 1500) 是 "增大 ADC"
+        // target_velocity < 0 (PWM < 1500) 是 "减小 ADC"
+
         if (at_min_limit && target_velocity < 0) {
+          // 在最小处, 且 PID 正试图 "减小 ADC", 停止。
           target_velocity = 0;
         } else if (at_max_limit && target_velocity > 0) {
+          // 在最大处, 且 PID 正试图 "增大 ADC", 停止。
           target_velocity = 0;
         }
       }
 
-      // 应用死区补偿 (Jump) (使用 config.h 中的 50)
+      // --- [START] 逻辑修改: 应用死区补偿 (Jump) ---
+      // (旧逻辑: if (abs(target_velocity) < PID_VELOCITY_DEADZONE) { target_velocity = 0; } )
+     
+      // 新逻辑: "跳过" 死区
       if (target_velocity > 0.0) {
         target_velocity += PID_VELOCITY_DEADZONE;
       } else if (target_velocity < 0.0) {
         target_velocity -= PID_VELOCITY_DEADZONE;
       }
+      // 如果 target_velocity 是 0.0, 它将保持 0.0.
+      // --- [END] 逻辑修改 ---
 
-      // 计算最终PWM (us)
+
+      // 4. 计算最终PWM (us)
       float pwm_us = 1500.0 + target_velocity;
+
+      // 最终钳位
       pwm_us = constrain(pwm_us, 1000.0, 2000.0);
 
-      // 更新 LEDC (硬件 PWM)
+      // 5. 更新 LEDC (硬件 PWM)
+      // (20000µs = 50Hz 周期)
       uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
+
+      // *** 已修复: 使用存储的 g_ledc_channels 数组 ***
       ledcWrite(g_ledc_channels[i], duty);
 
-      // 存储值供其他任务使用
+      // 6. 存储值供其他任务使用
       portENTER_CRITICAL(&g_pid_mux);
       g_final_pwm_us[i] = pwm_us;
+      // 将 1000-2000us 映射到 SBUS 范围
       g_sbus_channels[i] = map(pwm_us, 1000, 2000, SBUS_MIN_VAL, SBUS_MAX_VAL);
       portEXIT_CRITICAL(&g_pid_mux);
-    } // 结束 for 循环
-  } // 结束 while(true)
+    }
+
+    // --- 125µs 预算结束 ---
+  }
 #endif // 结束 DEBUG_FIXED_PWM_OUTPUT 的 #if
 }
 
-
 // 快速读取所有 ADC
 void IRAM_ATTR read_all_adcs() {
-  // 这是非 DMA 版本
+  // 这是非 DMA 版本，它会很慢
   for (int i = 0; i < NUM_SERVOS; i++) {
     portENTER_CRITICAL(&g_pid_mux);
     g_current_adc[i] = (float)analogRead(ADC_PINS[i]);
@@ -384,11 +393,13 @@ void IRAM_ATTR read_all_adcs() {
 void setup_pwm() {
   Serial.println("Setting up 8 LEDC channels...");
   for (int i = 0; i < NUM_SERVOS; i++) {
+    // *** 已修复: ESP32 3.x API - ledcAttach 替代 ledcSetup/ledcAttachPin ***
+    // ledcAttach(pin, freq, resolution) 返回分配的通道
     g_ledc_channels[i] = ledcAttach(PWM_PINS[i], 50, 16);  // 引脚, 50Hz, 16位
 
     // 设置初始中点
     uint32_t center_duty = (uint32_t)((1500.0 / 20000.0) * 65535.0);
-    ledcWrite(g_ledc_channels[i], center_duty);
+    ledcWrite(g_ledc_channels[i], center_duty);  // 使用返回的通道
     g_final_pwm_us[i] = 1500.0;
   }
 }
@@ -399,18 +410,22 @@ void setup_pid_controllers() {
   for (int i = 0; i < NUM_SERVOS; i++) {
     // 链接 QuickPID 到我们的全局变量
     pid_controllers[i] = QuickPID(
-      &g_current_adc[i],          // *Input
-      &g_pid_velocity_out[i],     // *Output
-      &g_target_adc[i],           // *Setpoint
+      &g_current_adc[i],        // *Input
+      &g_pid_velocity_out[i],   // *Output
+      &g_target_adc[i],         // *Setpoint
       DEFAULT_KP, DEFAULT_KI, DEFAULT_KD, // Tunings
       QuickPID::pMode::pOnError,      // Proportional on Error
       QuickPID::dMode::dOnMeas,       // Derivative on Measurement
       QuickPID::iAwMode::iAwCondition,  // Anti-windup
-      (QuickPID::Action)g_pid_reverse_action[i]  // 从 config.h 读取设置
+      //QuickPID::Action::direct      // Direct action
+      (QuickPID::Action)g_pid_reverse_action[i]  // <-- 从 config.h 读取设置
     );
 
+    // 设置 PID 采样时间 (虽然我们用定时器触发，但设置一下没坏处)
     pid_controllers[i].SetSampleTimeUs(PID_LOOP_PERIOD_US);
+    // 设置输出限制 (速度)
     pid_controllers[i].SetOutputLimits(-PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT);
+    // 切换到自动模式
     pid_controllers[i].SetMode(QuickPID::Control::automatic);
   }
 }
@@ -424,40 +439,52 @@ void setup_pid_controllers() {
 // USB Serial
 // -----------------
 
-// USB 轮询函数 (ASCII 协议, 以 \n 结尾)
+// --- [START] 修改: USB 轮询函数 (ASCII 协议, 以 \n 结尾) ---
 void handle_usb_input() {
   while (Serial.available() > 0) {
     char c = Serial.read();
 
+    // 忽略回车符，只关心换行符
     if (c == '\r') {
       continue;
     }
 
     if (c == '\n') {
+      // 收到行尾
       if (g_rx_buffer_idx > 0) {
+        // 确保字符串以 null 结尾
         g_rx_buffer[g_rx_buffer_idx] = '\0';
+       
+        // 解析命令
         parseUsbCommand();
+       
+        // 重置缓冲区
         g_rx_buffer_idx = 0;
       }
     } else {
+      // 将字符添加到缓冲区
       if (g_rx_buffer_idx < (RX_BUFFER_SIZE - 1)) {
         g_rx_buffer[g_rx_buffer_idx++] = c;
       } else {
+        // 缓冲区溢出，丢弃此行
         Serial.println("Error: USB command buffer overflow.");
         g_rx_buffer_idx = 0;
       }
     }
   }
 }
+// --- [END] 修改: USB 轮询函数 (ASCII 协议, 以 \n 结尾) ---
 
 
+// --- [START] 修改: ASCII 命令解析 (替换 parseUsbPacket) ---
 // 解析收到的 ASCII 命令
 void parseUsbCommand() {
+  // g_rx_buffer 现在包含一个以 null 结尾的命令字符串
   // 格式:
   // P <idx> <kp> <ki> <kd>
   // T <idx> <target>
   // A <idx>
-  // S <idx> <pwm_us>
+  // S <idx> <pwm_us>  <-- 新增
 
   char cmd_char;
   int items = sscanf(g_rx_buffer, "%c", &cmd_char);
@@ -471,13 +498,19 @@ void parseUsbCommand() {
     // 设置 PID: P <idx> <kp> <ki> <kd>
     int servo_idx = -1;
     float kp = 0, ki = 0, kd = 0;
+   
+    // sscanf 会返回成功匹配和分配的项数
     int parsed_items = sscanf(g_rx_buffer, "P %d %f %f %f", &servo_idx, &kp, &ki, &kd);
 
     if (parsed_items == 4) {
+      // 成功解析所有 4 个参数
       if (servo_idx >= 0 && servo_idx < NUM_SERVOS) {
+       
+        // 安全地更新 PID 控制器
         portENTER_CRITICAL(&g_pid_mux);
         pid_controllers[servo_idx].SetTunings(kp, ki, kd);
         portEXIT_CRITICAL(&g_pid_mux);
+
         Serial.printf("Set Servo %d Tunings: Kp=%.4f, Ki=%.4f, Kd=%.4f\n", servo_idx, kp, ki, kd);
       } else {
         Serial.printf("Error: Invalid servo index %d\n", servo_idx);
@@ -490,16 +523,21 @@ void parseUsbCommand() {
     // 设置目标: T <idx> <target>
     int servo_idx = -1;
     int target_val_int = 0;
+   
     int parsed_items = sscanf(g_rx_buffer, "T %d %d", &servo_idx, &target_val_int);
 
     if (parsed_items == 2) {
       if (servo_idx >= 0 && servo_idx < NUM_SERVOS) {
         uint16_t target_val = (uint16_t)target_val_int;
+
+        // 限制目标在安全范围内
         target_val = constrain(target_val, g_servo_limits[servo_idx].min_adc, g_servo_limits[servo_idx].max_adc);
 
+        // 安全地更新目标值
         portENTER_CRITICAL(&g_pid_mux);
         g_target_adc[servo_idx] = (float)target_val;
         portEXIT_CRITICAL(&g_pid_mux);
+
         Serial.printf("Set Servo %d Target to %d\n", servo_idx, target_val);
       } else {
         Serial.printf("Error: Invalid servo index %d\n", servo_idx);
@@ -511,6 +549,7 @@ void parseUsbCommand() {
   } else if (cmd_char == 'A') {
     // 自动调参: A <idx>
     int servo_idx = -1;
+   
     int parsed_items = sscanf(g_rx_buffer, "A %d", &servo_idx);
 
     if (parsed_items == 1) {
@@ -527,21 +566,27 @@ void parseUsbCommand() {
     } else {
       Serial.printf("Error: Invalid 'A' command format. Expected: A <idx>\n", g_rx_buffer);
     }
-  
+ 
+  // --- [START] 新增舵机测试命令 'S' ---
   } else if (cmd_char == 'S') {
-  
+ 
   #if DEBUG_FIXED_PWM_OUTPUT == 1
     // 舵机测试: S <idx> <pwm_us>
     int servo_idx = -1;
     int pwm_val_int = 0;
+   
     int parsed_items = sscanf(g_rx_buffer, "S %d %d", &servo_idx, &pwm_val_int);
 
     if (parsed_items == 2) {
       if (servo_idx >= 0 && servo_idx < NUM_SERVOS) {
+        // 限制 PWM 在 1000-2000us
         float pwm_us = (float)constrain(pwm_val_int, 1000, 2000);
+
+        // 安全地更新 g_final_pwm_us
         portENTER_CRITICAL(&g_pid_mux);
         g_final_pwm_us[servo_idx] = pwm_us;
         portEXIT_CRITICAL(&g_pid_mux);
+
         Serial.printf("DEBUG_PWM: Set Servo %d PWM to %.0f us\n", servo_idx, pwm_us);
       } else {
         Serial.printf("Error: Invalid servo index %d\n", servo_idx);
@@ -552,11 +597,13 @@ void parseUsbCommand() {
   #else
     Serial.println("Error: 'S' command is only available when DEBUG_FIXED_PWM_OUTPUT is 1.");
   #endif
+  // --- [END] 新增舵机测试命令 'S' ---
 
   } else {
     Serial.printf("Error: Unknown command '%s'\n", g_rx_buffer);
   }
 }
+// --- [END] 修改: ASCII 命令解析 (替换 parseUsbPacket) ---
 
 
 // 遥测数据输出
@@ -595,6 +642,7 @@ void handle_telemetry() {
 
 void setup_sbus() {
   // 配置 SBUS 串口
+  // *** 已修复: 使用 'invert'布尔参数 (true) ***
   SbusSerial.begin(SBUS_BAUD, SBUS_CONFIG, -1, SBUS_PIN, true);  // RX, TX, invert
 
   // 初始化通道数据
@@ -612,6 +660,7 @@ void sbusTask(void *pvParameters) {
     // 1. 准备 SBUS 帧
     sbus_frame[0] = 0x0F;  // 帧头
 
+    // 11位通道数据被打包到 22 个字节中
     // 我们需要安全地读取 g_sbus_channels
     uint16_t channels_copy[16];
     portENTER_CRITICAL(&g_pid_mux);
@@ -619,6 +668,7 @@ void sbusTask(void *pvParameters) {
     portEXIT_CRITICAL(&g_pid_mux);
 
     // 手动打包前8个通道
+    // 这是 SBUS 协议的标准打包方式
     sbus_frame[1] = (uint8_t)(channels_copy[0] & 0x07FF);
     sbus_frame[2] = (uint8_t)((channels_copy[0] & 0x07FF) >> 8 | (channels_copy[1] & 0x07FF) << 3);
     sbus_frame[3] = (uint8_t)((channels_copy[1] & 0x07FF) >> 5 | (channels_copy[2] & 0x07FF) << 6);
@@ -648,48 +698,64 @@ void sbusTask(void *pvParameters) {
 }
 
 // ======================================================================
-// ==                     AUTOTUNE (BLOCKING)
+// ==                    AUTOTUNE (BLOCKING)
 // ======================================================================
 
 // 自动调参输入函数 (供 autotune 库回调)
 double autotune_input_func(int servo_index) {
-  // [!] 修复: 不再调用 analogRead()
-  // 而是从主PID环路 (Core 1) 已经更新的全局数组中读取
-  double adc_value;
-  portENTER_CRITICAL(&g_pid_mux);
-  adc_value = (double)g_current_adc[servo_index];
-  portEXIT_CRITICAL(&g_pid_mux);
-  return adc_value;
+  return (double)analogRead(ADC_PINS[servo_index]);
 }
 
 // 自动调参输出函数 (供 autotune 库回调)
 void autotune_output_func(double output) {
-  // --- 修复: 喂狗 (WDT Reset) ---
+  // --- [START] 修复 2: 喂狗 (WDT Reset) ---
   // Autotune 是一个长时阻塞操作，在 Core 0 上运行
   // 调用 yield() 会交出控制权 (vTaskDelay(1))
   // 这会重置任务看门狗并防止重启
   yield(); 
+  // --- [END] 修复 2 ---
 
   // autotune 库的输出被配置为 1000-2000
   float pwm_us = constrain(output, 1000.0, 2000.0);
 
-  // --- 应用死区补偿 (Jump) (使用 config.h 中的 50) ---
+  // --- [START] 修复: Autotune 反向逻辑 ---
+  // Autotuner (relay) 假设 output HIGH (2000) 导致 input 增加.
+  // 如果舵机是反向的 (g_pid_reverse_action == 1),
+  // output HIGH (2000) 会导致 input 减小.
+  // 我们必须反转 autotuner 的输出才能使其正常振荡.
+  // [!] g_autotune_servo_idx 是在 start_autotune 中设置的全局变量
+  if (g_pid_reverse_action[g_autotune_servo_idx] == 1) {
+    // 映射 1000 -> 2000, 2000 -> 1000
+    pwm_us = 3000.0 - pwm_us;
+  }
+  // --- [END] 修复: Autotune 反向逻辑 ---
+
+
+  // --- [START] 逻辑修改: 应用死区补偿 (Jump) ---
+  // (旧逻辑: if (abs(velocity) < 100) pwm_us = 1500; )
+
+  // 将 PWM (1000-2000) 转换回 速度 (-500, +500)
   float velocity_out = pwm_us - 1500.0; 
+
+  // 新逻辑: "跳过" 死区
+  // (与 pidLoopTask 中的逻辑保持一致)
   if (velocity_out > 0.0) {
     velocity_out += PID_VELOCITY_DEADZONE;
   } else if (velocity_out < 0.0) {
     velocity_out -= PID_VELOCITY_DEADZONE;
   }
-  
+ 
+  // 将补偿后的速度转换回 PWM
   pwm_us = 1500.0 + velocity_out;
-  pwm_us = constrain(pwm_us, 1000.0, 2000.0);
-  // --- 结束死区逻辑 ---
 
-  // [!] 修复: 不再直接写入 ledcWrite
-  // 而是更新全局变量，让 pidLoopTask (Core 1) 来写入
-  portENTER_CRITICAL(&g_pid_mux);
-  g_final_pwm_us[g_autotune_servo_idx] = pwm_us;
-  portEXIT_CRITICAL(&g_pid_mux);
+  // 再次钳位，因为我们增加了速度值
+  pwm_us = constrain(pwm_us, 1000.0, 2000.0);
+  // --- [END] 逻辑修改 ---
+
+  // 直接写入 PWM
+  uint32_t duty = (uint32_t)((pwm_us / 20000.0) * 65535.0);
+  // *** 已修复: 使用 g_ledc_channels 数组 ***
+  ledcWrite(g_ledc_channels[g_autotune_servo_idx], duty);
 }
 
 // 启动自动调参的函数
@@ -699,45 +765,44 @@ void start_autotune(int servo_index) {
   g_is_autotuning = true;
   g_autotune_servo_idx = servo_index;
 
-  // --- [START] 修复: 移除 vTaskSuspend ---
-  // 我们不再暂停 PID 任务，以避免 ADC 死锁
-  Serial.printf("Autotuning Servo %d. PID task (Core 1) will continue running.\n", servo_index);
-  // --- [END] 修复 ---
-
+  Serial.printf("Suspending PID Task on Core 1 for Autotune (Servo %d).\n", servo_index);
+  // 1. 暂停 8kHz PID 环路
+  vTaskSuspend(g_pid_task_handle);
 
   // 2. 配置调谐器
-  g_tuning_pid_instance = PID(
-    g_servo_limits[servo_index].center_adc,  // 目标值
-    10000,                  // 环路间隔 (us) -> 10ms
-    1000, 2000                // 输出范围 (pwm us)
-  );
-  
-  // 确保 Autotune 使用正确的舵机方向
-  if (g_pid_reverse_action[servo_index] == 1) {
-    g_tuning_pid_instance.SetControllerDirection(REVERSE);
-    Serial.println("Autotune PID set to REVERSE mode.");
-  } else {
-    g_tuning_pid_instance.SetControllerDirection(DIRECT);
-    Serial.println("Autotune PID set to DIRECT mode.");
-  }
+  // g_tuning_pid_instance (type PID) 已经全局创建 (PID())
+  // 我们必须使用 setter 方法 (根据 pid.h)
+  g_tuning_pid_instance.setSetPoint(g_servo_limits[servo_index].center_adc); // [!] 修复构造函数错误
+  g_tuning_pid_instance.setConstrains(1000.0, 2000.0); // [!] 修复构造函数错误
+ 
+  // --- [START] 修复编译错误 ---
+  // 移除对不存在的函数 SetControllerDirection 的调用
+  // 反向逻辑已被移至 autotune_output_func()
+  // --- [END] 修复编译错误 ---
 
   g_autotuner.setPID(g_tuning_pid_instance);
   g_autotuner.setTargetValue(g_servo_limits[servo_index].center_adc);
   g_autotuner.setConstrains(1000.0, 2000.0);  // 输出是 PWM us
-  g_autotuner.setLoopInterval(10000);       // 10ms
+  
+  // [!] 已修正编译错误 (移除了 "S (Ch 1)")
+  g_autotuner.setLoopInterval(10000);        // 10ms  
   g_autotuner.setTuningCycles(10);
   g_autotuner.setMode(pid_tuner::mode_t::CLASSIC_PID);
 
+  // 打印反向状态
+  if (g_pid_reverse_action[servo_index] == 1) {
+    Serial.println("Autotune: Logic will be inverted in output function for REVERSE servo.");
+  } else {
+    Serial.println("Autotune: Using DIRECT output logic.");
+  }
+
   Serial.println("Autotuner configured. Starting tuning loop (this is blocking)...");
-  Serial.println("Telemetry will pause during tuning.");
 
   // 3. 运行阻塞的调谐
   // 这将接管, 直到调谐完成
-  // 它现在调用我们修改过的 autotune_input_func 和 autotune_output_func
   g_autotuner.tune(autotune_input_func, servo_index, autotune_output_func);
 
   Serial.println("Tuning complete.");
-  Serial.println("Telemetry will now resume.");
 
   // 4. 获取调谐结果
   float Kp = g_autotuner.getKp();
@@ -753,10 +818,9 @@ void start_autotune(int servo_index) {
 
   Serial.printf("New tunings applied to QuickPID Servo %d.\n", servo_index);
 
-  // --- [START] 修复: 移除 vTaskResume ---
-  // vTaskResume(g_pid_task_handle); // <-- 移除
-  // --- [END] 修复 ---
+  // 6. 恢复 8kHz PID 环路
+  vTaskResume(g_pid_task_handle);
+  Serial.println("Resumed PID Task on Core 1.");
 
   g_is_autotuning = false;
 }
-//@FILE Dq_Vtol_Esp32s3_SbusTest2.ino END
