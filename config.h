@@ -22,7 +22,7 @@
 
 // ADC 反馈引脚
 const int ADC_PINS[NUM_SERVOS] = {
-  1, 2, 4, 5, 6, 7, 8, 9
+  2, 1, 4, 5, 6, 7, 8, 9
 };
 /*
  * * S0 -> GPIO 1
