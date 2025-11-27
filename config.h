@@ -1,3 +1,4 @@
+//@FILE config.h START
 #pragma once
 
 // ======================================================================
@@ -85,7 +86,7 @@ const int PWM_PINS[NUM_SERVOS] = {
 // 1 = QuickPID::Action::reverse (反向): TGT > ADC 时, PWM < 1500
 
 const uint8_t g_pid_reverse_action[NUM_SERVOS] = {
-  0,  // 舵机 0 (正向)
+  1,  // 舵机 0 (正向)
   0,  // 舵机 1 (正向)
   1,  // 舵机 2 (反向)
   0,  // 舵机 3 (正向)
@@ -157,3 +158,4 @@ const ServoLimitRange g_servo_limits[NUM_SERVOS] = {
 #define SBUS_MIN_VAL 172
 #define SBUS_MAX_VAL 1811
 #define SBUS_CENTER_VAL 992
+//@FILE config.h END
